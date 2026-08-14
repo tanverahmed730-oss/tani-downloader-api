@@ -1,17 +1,11 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import yt_dlp
-import os
-import uuid
 
 app = FastAPI(title="Tani Downloader API")
 
-DOWNLOAD_DIR = "/tmp/tani_downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-
-class DownloadRequest(BaseModel):
+class ResolveRequest(BaseModel):
     url: str
 
 
@@ -28,46 +22,60 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/download")
-def download_media(request: DownloadRequest):
+@app.post("/resolve")
+def resolve_media(request: ResolveRequest):
     url = request.url.strip()
 
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL")
 
-    job_id = str(uuid.uuid4())
-    output_template = os.path.join(DOWNLOAD_DIR, job_id + ".%(ext)s")
-
     options = {
-        "outtmpl": output_template,
-        "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "restrictfilenames": True,
+        "noplaylist": True,
+        "skip_download": True,
         "format": "best[ext=mp4]/best",
     }
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+            info = ydl.extract_info(url, download=False)
 
-        if not os.path.exists(filename):
-            raise HTTPException(
-                status_code=500,
-                detail="Downloaded file was not created"
-            )
+            formats = info.get("formats", [])
 
-        return FileResponse(
-            path=filename,
-            media_type="video/mp4",
-            filename=os.path.basename(filename)
-        )
+            if not formats:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No media formats found"
+                )
+
+            selected = None
+
+            for fmt in reversed(formats):
+                direct_url = fmt.get("url")
+                if direct_url:
+                    selected = fmt
+                    break
+
+            if not selected:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No direct media URL available"
+                )
+
+            return {
+                "success": True,
+                "title": info.get("title"),
+                "platform": info.get("extractor_key"),
+                "mimeType": selected.get("mime_type"),
+                "extension": selected.get("ext"),
+                "directMediaUrl": selected.get("url")
+            }
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=400,
-            detail=f"Media could not be processed: {str(e)}"
+            detail=f"Media could not be resolved: {str(e)}"
         )
