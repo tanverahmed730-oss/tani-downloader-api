@@ -11,46 +11,96 @@ DOWNLOAD_DIR = "/tmp/tani_downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-class DownloadRequest(BaseModel):
+class MediaRequest(BaseModel):
     url: str
+
+
+def validate_url(url: str):
+    url = url.strip()
+
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid URL"
+        )
+
+    return url
+
+
+def get_platform(info):
+    extractor = (
+        info.get("extractor_key")
+        or info.get("extractor")
+        or ""
+    )
+
+    return extractor
+
+
+def create_ydl_options():
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "restrictfilenames": True,
+
+        # Prefer MP4 when available.
+        "format": (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "best[ext=mp4]/"
+            "best"
+        ),
+
+        "merge_output_format": "mp4",
+
+        # Avoid unnecessary interactive behaviour.
+        "noprogress": True,
+    }
 
 
 @app.get("/")
 def home():
     return {
         "status": "online",
-        "service": "Tani Downloader API"
+        "service": "Tani Downloader API",
+        "supported": [
+            "YouTube",
+            "TikTok",
+            "Facebook",
+            "Instagram",
+            "Snapchat"
+        ]
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
 
 
 @app.post("/resolve")
-def resolve_media(request: DownloadRequest):
-    url = request.url.strip()
+def resolve_media(request: MediaRequest):
+    url = validate_url(request.url)
 
-    if not url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="Invalid URL")
-
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
-        "format": "best[ext=mp4]/best",
-    }
+    options = create_ydl_options()
+    options["skip_download"] = True
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
 
             direct_url = info.get("url")
 
             if not direct_url:
-                for fmt in reversed(info.get("formats", [])):
+                formats = info.get("formats", [])
+
+                # Find the best usable single media URL.
+                for fmt in reversed(formats):
                     if fmt.get("url"):
                         direct_url = fmt["url"]
                         break
@@ -64,7 +114,7 @@ def resolve_media(request: DownloadRequest):
             return {
                 "success": True,
                 "title": info.get("title"),
-                "platform": info.get("extractor_key"),
+                "platform": get_platform(info),
                 "mimeType": info.get("mime_type"),
                 "extension": info.get("ext"),
                 "directMediaUrl": direct_url
@@ -72,6 +122,7 @@ def resolve_media(request: DownloadRequest):
 
     except HTTPException:
         raise
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
@@ -80,11 +131,8 @@ def resolve_media(request: DownloadRequest):
 
 
 @app.post("/download")
-def download_media(request: DownloadRequest):
-    url = request.url.strip()
-
-    if not url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="Invalid URL")
+def download_media(request: MediaRequest):
+    url = validate_url(request.url)
 
     job_id = str(uuid.uuid4())
 
@@ -93,25 +141,33 @@ def download_media(request: DownloadRequest):
         job_id + ".%(ext)s"
     )
 
-    options = {
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "restrictfilenames": True,
-        "format": "best[ext=mp4]/best",
-    }
+    options = create_ydl_options()
+    options["outtmpl"] = output_template
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(
+                url,
+                download=True
+            )
+
             filename = ydl.prepare_filename(info)
 
+        # yt-dlp can merge/convert to mp4, so check the
+        # actual generated file and possible mp4 variant.
         if not os.path.exists(filename):
-            raise Exception("Downloaded file was not created")
+            base, _ = os.path.splitext(filename)
+            mp4_filename = base + ".mp4"
+
+            if os.path.exists(mp4_filename):
+                filename = mp4_filename
+            else:
+                raise Exception(
+                    "Downloaded file was not created"
+                )
 
         return FileResponse(
-            filename,
+            path=filename,
             media_type="video/mp4",
             filename=os.path.basename(filename)
         )
