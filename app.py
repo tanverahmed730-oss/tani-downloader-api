@@ -5,6 +5,7 @@ import yt_dlp
 import os
 import uuid
 import glob
+import shutil
 
 app = FastAPI(title="Tani Downloader API")
 
@@ -39,11 +40,11 @@ def get_platform(info):
 def create_ydl_options(output_template=None):
     options = {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "noplaylist": True,
         "noprogress": True,
 
-        # Prefer a single downloadable MP4 first.
+        # Prefer MP4 when available.
         "format": (
             "best[ext=mp4]/"
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
@@ -52,7 +53,6 @@ def create_ydl_options(output_template=None):
 
         "merge_output_format": "mp4",
 
-        # More compatible HTTP behaviour.
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -62,12 +62,18 @@ def create_ydl_options(output_template=None):
             "Accept-Language": "en-US,en;q=0.9",
         },
 
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 5,
+        "fragment_retries": 5,
         "socket_timeout": 30,
 
-        # Do not abort the whole extraction because of one unavailable format.
-        "ignoreerrors": False,
+        # Important for servers.
+        "continuedl": True,
+
+        # Don't download playlists.
+        "noplaylist": True,
+
+        # Keep the output clean.
+        "overwrites": True,
     }
 
     if output_template:
@@ -81,33 +87,29 @@ def home():
     return {
         "status": "online",
         "service": "Tani Downloader API",
-        "version": "2.0",
-        "supported": [
-            "YouTube",
-            "TikTok",
-            "Facebook",
-            "Instagram",
-            "Snapchat"
-        ]
+        "version": "3.0",
+        "endpoints": {
+            "health": "/health",
+            "resolve": "/resolve",
+            "download": "/download"
+        }
     }
 
 
 @app.get("/health")
 def health():
     return {
-        "status": "ok"
+        "status": "ok",
+        "yt_dlp_version": getattr(
+            yt_dlp.version,
+            "__version__",
+            "unknown"
+        )
     }
 
 
 @app.post("/resolve")
 def resolve_media(request: MediaRequest):
-    """
-    Resolve metadata only.
-
-    IMPORTANT:
-    This endpoint does NOT depend on returning a direct media URL.
-    The Android app should eventually use /download instead.
-    """
 
     url = validate_url(request.url)
 
@@ -122,40 +124,69 @@ def resolve_media(request: MediaRequest):
             )
 
         if not info:
-            raise HTTPException(
-                status_code=404,
-                detail="Video information could not be found"
+            raise Exception(
+                "Extractor returned no media information"
             )
 
         return {
             "success": True,
             "title": info.get("title"),
             "platform": get_platform(info),
-            "extension": info.get("ext"),
             "duration": info.get("duration"),
             "thumbnail": info.get("thumbnail"),
-            "message": "Media detected. Use /download to download."
+            "extension": info.get("ext"),
+            "message": "Media detected successfully."
         }
 
-    except HTTPException:
-        raise
-
     except Exception as e:
+
+        error = str(e)
+
+        if "Sign in to confirm" in error:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This media is currently protected by the "
+                    "platform and requires authentication or "
+                    "anti-bot verification. Anonymous download "
+                    "is not available for this media."
+                )
+            )
+
+        if "login" in error.lower() or "authentication" in error.lower():
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This media requires authentication. "
+                    "Tani Downloader only supports publicly "
+                    "accessible media without account login."
+                )
+            )
+
+        if "403" in error:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "The platform rejected the media request "
+                    "(HTTP 403). This is a platform-side "
+                    "access restriction, not an Android app error."
+                )
+            )
+
+        if "Unsupported URL" in error:
+            raise HTTPException(
+                status_code=400,
+                detail="This URL is not supported."
+            )
+
         raise HTTPException(
-            status_code=400,
-            detail=f"Media could not be resolved: {str(e)}"
+            status_code=502,
+            detail=f"Media could not be resolved: {error}"
         )
 
 
 @app.post("/download")
 def download_media(request: MediaRequest):
-    """
-    Download the media on the server and return the actual file.
-
-    The client does NOT download a direct TikTok/YouTube CDN URL.
-    The server downloads the media first and then sends the file
-    back to the client.
-    """
 
     url = validate_url(request.url)
 
@@ -166,10 +197,14 @@ def download_media(request: MediaRequest):
         job_id + ".%(ext)s"
     )
 
-    options = create_ydl_options(output_template)
+    options = create_ydl_options(
+        output_template
+    )
 
     try:
+
         with yt_dlp.YoutubeDL(options) as ydl:
+
             info = ydl.extract_info(
                 url,
                 download=True
@@ -177,30 +212,38 @@ def download_media(request: MediaRequest):
 
             if not info:
                 raise Exception(
-                    "Extractor returned no media information"
+                    "No media information returned."
                 )
 
-            prepared_filename = ydl.prepare_filename(info)
+            prepared_filename = ydl.prepare_filename(
+                info
+            )
 
-        # Look for the actual generated file.
+        # Find downloaded file.
         possible_files = []
 
-        if os.path.exists(prepared_filename):
-            possible_files.append(prepared_filename)
+        if os.path.isfile(prepared_filename):
+            possible_files.append(
+                prepared_filename
+            )
 
-        base = os.path.splitext(prepared_filename)[0]
+        base = os.path.splitext(
+            prepared_filename
+        )[0]
 
         for extension in [
             ".mp4",
-            ".mkv",
             ".webm",
+            ".mkv",
             ".mov",
+            ".avi",
             ".m4a",
-            ".avi"
+            ".mp3"
         ]:
-            possible_files.append(base + extension)
+            possible_files.append(
+                base + extension
+            )
 
-        # Also search by job ID in case yt-dlp changed the extension.
         possible_files.extend(
             glob.glob(
                 os.path.join(
@@ -212,18 +255,20 @@ def download_media(request: MediaRequest):
 
         filename = None
 
-        for file_path in possible_files:
-            if os.path.isfile(file_path):
-                filename = file_path
+        for path in possible_files:
+            if os.path.isfile(path):
+                filename = path
                 break
 
         if not filename:
             raise Exception(
-                "Downloaded file was not created"
+                "Download completed but the output file "
+                "could not be found."
             )
 
-        # Detect media type.
-        extension = os.path.splitext(filename)[1].lower()
+        extension = os.path.splitext(
+            filename
+        )[1].lower()
 
         media_types = {
             ".mp4": "video/mp4",
@@ -232,6 +277,7 @@ def download_media(request: MediaRequest):
             ".mov": "video/quicktime",
             ".avi": "video/x-msvideo",
             ".m4a": "audio/mp4",
+            ".mp3": "audio/mpeg"
         }
 
         media_type = media_types.get(
@@ -242,39 +288,59 @@ def download_media(request: MediaRequest):
         return FileResponse(
             path=filename,
             media_type=media_type,
-            filename=os.path.basename(filename)
+            filename=os.path.basename(filename),
+            background=None
         )
 
-    except HTTPException:
-        raise
-
     except Exception as e:
-        error_text = str(e)
 
-        # Give useful errors instead of hiding everything behind
-        # an unexplained generic 500.
-        if "403" in error_text:
+        error = str(e)
+
+        if "Sign in to confirm" in error:
             detail = (
-                "The platform rejected the server download request "
-                "(HTTP 403). The media requires a different extractor "
-                "or access method."
+                "This media requires authentication or "
+                "anti-bot verification and cannot be "
+                "downloaded anonymously."
             )
 
-        elif "Sign in" in error_text or "login" in error_text.lower():
-            detail = (
-                "This media requires login/authentication and cannot "
-                "be downloaded anonymously."
+            raise HTTPException(
+                status_code=403,
+                detail=detail
             )
 
-        elif "Unsupported URL" in error_text:
-            detail = (
-                "This URL is not currently supported by yt-dlp."
+        if (
+            "login" in error.lower()
+            or "authentication" in error.lower()
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This media requires authentication. "
+                    "Only publicly accessible media can "
+                    "be downloaded."
+                )
             )
 
-        else:
-            detail = f"Download failed: {error_text}"
+        if "403" in error:
+            detail = (
+                "The platform rejected the download request "
+                "(HTTP 403). The media is currently protected "
+                "or requires an access method not available "
+                "to anonymous server downloads."
+            )
+
+            raise HTTPException(
+                status_code=403,
+                detail=detail
+            )
+
+        if "Unsupported URL" in error:
+            raise HTTPException(
+                status_code=400,
+                detail="This URL is not supported."
+            )
 
         raise HTTPException(
             status_code=502,
-            detail=detail
+            detail=f"Download failed: {error}"
         )
