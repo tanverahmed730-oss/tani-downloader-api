@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import yt_dlp
 import os
@@ -49,17 +50,22 @@ def download_media(request: DownloadRequest):
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
-
             filename = ydl.prepare_filename(info)
 
-            return {
-                "success": True,
-                "title": info.get("title"),
-                "platform": info.get("extractor_key"),
-                "filename": os.path.basename(filename),
-                "message": "Download completed"
-            }
+        if not os.path.exists(filename):
+            raise HTTPException(
+                status_code=500,
+                detail="Downloaded file was not created"
+            )
 
+        return FileResponse(
+            path=filename,
+            media_type="video/mp4",
+            filename=os.path.basename(filename)
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=400,
