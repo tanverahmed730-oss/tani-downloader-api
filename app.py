@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import yt_dlp
 import os
 import uuid
+import glob
 
 app = FastAPI(title="Tani Downloader API")
 
@@ -28,34 +29,51 @@ def validate_url(url: str):
 
 
 def get_platform(info):
-    extractor = (
+    return (
         info.get("extractor_key")
         or info.get("extractor")
-        or ""
+        or "Unknown"
     )
 
-    return extractor
 
-
-def create_ydl_options():
-    return {
+def create_ydl_options(output_template=None):
+    options = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "restrictfilenames": True,
+        "noprogress": True,
 
-        # Prefer MP4 when available.
+        # Prefer a single downloadable MP4 first.
         "format": (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
             "best[ext=mp4]/"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
             "best"
         ),
 
         "merge_output_format": "mp4",
 
-        # Avoid unnecessary interactive behaviour.
-        "noprogress": True,
+        # More compatible HTTP behaviour.
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+
+        # Do not abort the whole extraction because of one unavailable format.
+        "ignoreerrors": False,
     }
+
+    if output_template:
+        options["outtmpl"] = output_template
+
+    return options
 
 
 @app.get("/")
@@ -63,6 +81,7 @@ def home():
     return {
         "status": "online",
         "service": "Tani Downloader API",
+        "version": "2.0",
         "supported": [
             "YouTube",
             "TikTok",
@@ -82,6 +101,14 @@ def health():
 
 @app.post("/resolve")
 def resolve_media(request: MediaRequest):
+    """
+    Resolve metadata only.
+
+    IMPORTANT:
+    This endpoint does NOT depend on returning a direct media URL.
+    The Android app should eventually use /download instead.
+    """
+
     url = validate_url(request.url)
 
     options = create_ydl_options()
@@ -94,31 +121,21 @@ def resolve_media(request: MediaRequest):
                 download=False
             )
 
-            direct_url = info.get("url")
+        if not info:
+            raise HTTPException(
+                status_code=404,
+                detail="Video information could not be found"
+            )
 
-            if not direct_url:
-                formats = info.get("formats", [])
-
-                # Find the best usable single media URL.
-                for fmt in reversed(formats):
-                    if fmt.get("url"):
-                        direct_url = fmt["url"]
-                        break
-
-            if not direct_url:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No direct media stream"
-                )
-
-            return {
-                "success": True,
-                "title": info.get("title"),
-                "platform": get_platform(info),
-                "mimeType": info.get("mime_type"),
-                "extension": info.get("ext"),
-                "directMediaUrl": direct_url
-            }
+        return {
+            "success": True,
+            "title": info.get("title"),
+            "platform": get_platform(info),
+            "extension": info.get("ext"),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "message": "Media detected. Use /download to download."
+        }
 
     except HTTPException:
         raise
@@ -132,6 +149,14 @@ def resolve_media(request: MediaRequest):
 
 @app.post("/download")
 def download_media(request: MediaRequest):
+    """
+    Download the media on the server and return the actual file.
+
+    The client does NOT download a direct TikTok/YouTube CDN URL.
+    The server downloads the media first and then sends the file
+    back to the client.
+    """
+
     url = validate_url(request.url)
 
     job_id = str(uuid.uuid4())
@@ -141,8 +166,7 @@ def download_media(request: MediaRequest):
         job_id + ".%(ext)s"
     )
 
-    options = create_ydl_options()
-    options["outtmpl"] = output_template
+    options = create_ydl_options(output_template)
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -151,29 +175,106 @@ def download_media(request: MediaRequest):
                 download=True
             )
 
-            filename = ydl.prepare_filename(info)
-
-        # yt-dlp can merge/convert to mp4, so check the
-        # actual generated file and possible mp4 variant.
-        if not os.path.exists(filename):
-            base, _ = os.path.splitext(filename)
-            mp4_filename = base + ".mp4"
-
-            if os.path.exists(mp4_filename):
-                filename = mp4_filename
-            else:
+            if not info:
                 raise Exception(
-                    "Downloaded file was not created"
+                    "Extractor returned no media information"
                 )
+
+            prepared_filename = ydl.prepare_filename(info)
+
+        # Look for the actual generated file.
+        possible_files = []
+
+        if os.path.exists(prepared_filename):
+            possible_files.append(prepared_filename)
+
+        base = os.path.splitext(prepared_filename)[0]
+
+        for extension in [
+            ".mp4",
+            ".mkv",
+            ".webm",
+            ".mov",
+            ".m4a",
+            ".avi"
+        ]:
+            possible_files.append(base + extension)
+
+        # Also search by job ID in case yt-dlp changed the extension.
+        possible_files.extend(
+            glob.glob(
+                os.path.join(
+                    DOWNLOAD_DIR,
+                    job_id + ".*"
+                )
+            )
+        )
+
+        filename = None
+
+        for file_path in possible_files:
+            if os.path.isfile(file_path):
+                filename = file_path
+                break
+
+        if not filename:
+            raise Exception(
+                "Downloaded file was not created"
+            )
+
+        # Detect media type.
+        extension = os.path.splitext(filename)[1].lower()
+
+        media_types = {
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".mkv": "video/x-matroska",
+            ".mov": "video/quicktime",
+            ".avi": "video/x-msvideo",
+            ".m4a": "audio/mp4",
+        }
+
+        media_type = media_types.get(
+            extension,
+            "application/octet-stream"
+        )
 
         return FileResponse(
             path=filename,
-            media_type="video/mp4",
+            media_type=media_type,
             filename=os.path.basename(filename)
         )
 
+    except HTTPException:
+        raise
+
     except Exception as e:
+        error_text = str(e)
+
+        # Give useful errors instead of hiding everything behind
+        # an unexplained generic 500.
+        if "403" in error_text:
+            detail = (
+                "The platform rejected the server download request "
+                "(HTTP 403). The media requires a different extractor "
+                "or access method."
+            )
+
+        elif "Sign in" in error_text or "login" in error_text.lower():
+            detail = (
+                "This media requires login/authentication and cannot "
+                "be downloaded anonymously."
+            )
+
+        elif "Unsupported URL" in error_text:
+            detail = (
+                "This URL is not currently supported by yt-dlp."
+            )
+
+        else:
+            detail = f"Download failed: {error_text}"
+
         raise HTTPException(
-            status_code=500,
-            detail=f"Download failed: {str(e)}"
+            status_code=502,
+            detail=detail
         )
