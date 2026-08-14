@@ -1,11 +1,17 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import yt_dlp
+import os
+import uuid
 
 app = FastAPI(title="Tani Downloader API")
 
+DOWNLOAD_DIR = "/tmp/tani_downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-class ResolveRequest(BaseModel):
+
+class DownloadRequest(BaseModel):
     url: str
 
 
@@ -22,60 +28,64 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/resolve")
-def resolve_media(request: ResolveRequest):
+@app.post("/download")
+def download_media(request: DownloadRequest):
     url = request.url.strip()
 
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid URL")
 
+    job_id = str(uuid.uuid4())
+    output_template = os.path.join(
+        DOWNLOAD_DIR,
+        job_id + ".%(ext)s"
+    )
+
     options = {
+        "outtmpl": output_template,
+        "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
+        "restrictfilenames": True,
         "format": "best[ext=mp4]/best",
     }
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
 
-            formats = info.get("formats", [])
+        if not os.path.exists(filename):
+            raise Exception("Downloaded file was not created")
 
-            if not formats:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No media formats found"
-                )
+        file_size = os.path.getsize(filename)
 
-            selected = None
+        def file_stream():
+            try:
+                with open(filename, "rb") as file:
+                    while True:
+                        chunk = file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                try:
+                    os.remove(filename)
+                except Exception:
+                    pass
 
-            for fmt in reversed(formats):
-                direct_url = fmt.get("url")
-                if direct_url:
-                    selected = fmt
-                    break
+        return StreamingResponse(
+            file_stream(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="{os.path.basename(filename)}"',
+                "Content-Length": str(file_size),
+            },
+        )
 
-            if not selected:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No direct media URL available"
-                )
-
-            return {
-                "success": True,
-                "title": info.get("title"),
-                "platform": info.get("extractor_key"),
-                "mimeType": selected.get("mime_type"),
-                "extension": selected.get("ext"),
-                "directMediaUrl": selected.get("url")
-            }
-
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(
-            status_code=400,
-            detail=f"Media could not be resolved: {str(e)}"
+            status_code=500,
+            detail=f"Download failed: {str(e)}"
         )
